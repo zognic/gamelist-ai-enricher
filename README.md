@@ -51,8 +51,20 @@ pip install requests pymupdf
 |---|---|
 | `requests` | HTTP calls to the Ollama API |
 | `pymupdf` (`fitz`) | Reading and extracting text from PDF files |
+| `pillow` | Image handling for CBZ support *(optional)* |
+| `pytesseract` | OCR text extraction for CBZ support *(optional)* |
 
-All other modules used (`os`, `re`, `json`, `xml.etree.ElementTree`, `argparse`) are part of the Python standard library — no additional installation needed.
+All other modules used (`os`, `re`, `json`, `xml.etree.ElementTree`, `argparse`, `zipfile`, `logging`) are part of the Python standard library — no additional installation needed.
+
+To enable CBZ support, install the optional dependencies and Tesseract on your system:
+
+```bash
+pip install pillow pytesseract
+```
+
+> See the [magazines/README.md](magazines/README.md) for the full Tesseract installation guide (macOS, Linux, Windows).
+
+> ⚠️ **CBZ processing is significantly slower than PDF** — each page is run through OCR individually. A 100-page magazine may take 1–3 minutes per search. OCR-processed PDF files are strongly recommended when both formats are available.
 
 ---
 
@@ -100,6 +112,7 @@ gamelist-ai-enricher/
 │
 ├── gamelist_updater.py       # Main script
 ├── gamelist.xml              # Your source gamelist (you provide this)
+├── gamelist_updater.log      # Auto-generated log file (created on first run)
 │
 ├── prompts/
 │   ├── prompt_default.json   # Default prompt (French, epic journalistic tone)
