@@ -1,159 +1,307 @@
 import os
 import re
+import zipfile
+import logging
 import requests
 import json
 import xml.etree.ElementTree as ET
 import argparse
 import fitz  # PyMuPDF
 
+try:
+    from PIL import Image
+    import pytesseract
+    CBZ_SUPPORT = True
+except ImportError:
+    CBZ_SUPPORT = False
+
+# ─────────────────────────────────────────────
+# Constants
+# ─────────────────────────────────────────────
+
 OLLAMA_URL        = "http://localhost:11434/api/generate"
 MODEL_NAME        = "mistral"
-DOSSIER_MAGAZINES = "./magazines/"
-FICHIER_SOURCE    = "gamelist.xml"
-FICHIER_FINAL     = "gamelist_updated.xml"
-PROMPT_DEFAUT     = "./prompts/prompt_default.json"
+MAGAZINES_DIR     = "./magazines/"
+SOURCE_FILE       = "gamelist.xml"
+OUTPUT_FILE       = "gamelist_updated.xml"
+DEFAULT_PROMPT    = "./prompts/prompt_default.json"
+LOG_FILE          = "gamelist_updater.log"
 
 
-# ---------------------------------------------
-# Chargement du prompt externe
-# ---------------------------------------------
+# ─────────────────────────────────────────────
+# Logging setup
+# ─────────────────────────────────────────────
+# All messages go to the log file.
+# Only high-level progress messages are printed to the terminal.
 
-def charger_prompt(chemin_json):
+logging.basicConfig(
+    filename=LOG_FILE,
+    filemode="a",
+    encoding="utf-8",
+    level=logging.DEBUG,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+
+def log(msg, level="info"):
+    """Write a message to the log file only."""
+    getattr(logging, level)(msg)
+
+def out(msg, level="info"):
+    """Print a message to the terminal AND write it to the log file."""
+    print(msg)
+    getattr(logging, level)(msg)
+
+
+# ─────────────────────────────────────────────
+# Prompt loading
+# ─────────────────────────────────────────────
+
+def load_prompt(json_path):
     """
-    Charge un fichier prompt .json structure avec des cles nommees :
+    Load a structured prompt from a JSON file with named keys:
     {
-        "name":           "Nom lisible",
-        "role":           "...",
-        "goal":           "...",
-        "steps":          ["...", "..."],
-        "tone":           "...",          (facultatif)
-        "language":       "...",          (facultatif)
-        "constraints":    ["...", "..."], (facultatif)
-        "output_example": { ... }
+        "name":           "Human-readable name",
+        "role":           "LLM identity and expertise",
+        "goal":           "What the LLM must produce",
+        "steps":          ["Step 1", "Step 2", ...],
+        "tone":           "Writing style (optional)",
+        "language":       "Language constraint (optional)",
+        "constraints":    ["Hard rule 1", ...] (optional),
+        "output_example": { ... }  (JSON object used as format reference)
     }
+    Raises FileNotFoundError or ValueError on invalid input.
     """
-    if not os.path.exists(chemin_json):
+    if not os.path.exists(json_path):
         raise FileNotFoundError(
-            f"Fichier prompt introuvable : '{chemin_json}'\n"
-            f"Creez un fichier JSON dans ./prompts/ ou specifiez -prompt <chemin>."
+            f"Prompt file not found: '{json_path}'\n"
+            f"Create a JSON file in ./prompts/ or specify -prompt <path>."
         )
-    with open(chemin_json, "r", encoding="utf-8") as f:
+    with open(json_path, "r", encoding="utf-8") as f:
         data = json.load(f)
-    for cle in ("name", "role", "goal", "steps", "output_example"):
-        if cle not in data:
+    for key in ("name", "role", "goal", "steps", "output_example"):
+        if key not in data:
             raise ValueError(
-                f"Le fichier prompt '{chemin_json}' doit contenir la cle '{cle}'."
+                f"Prompt file '{json_path}' is missing required key: '{key}'."
             )
-    print(f"  [Prompt] '{data['name']}' charge depuis '{chemin_json}'")
+    out(f"  [Prompt] '{data['name']}' loaded from '{json_path}'")
+    log(f"Prompt loaded: {json_path}")
     return data
 
 
-def construire_prompt_texte(prompt_data, nom_brut, contexte_pdf):
+def build_prompt_text(prompt_data, game_name, pdf_context):
     """
-    Reconstruit le texte du prompt envoye au LLM a partir des cles structurees du JSON.
+    Reconstruct the full prompt string from the structured JSON keys.
+    Injects game_name and pdf_context at the appropriate locations.
+    Uses str.replace() instead of str.format() to avoid conflicts
+    with literal curly braces in step descriptions (e.g. JSON examples).
     """
-    lignes = []
-    lignes.append(f"ROLE : {prompt_data['role']}\n")
-    lignes.append(f"OBJECTIF : {prompt_data['goal']}\n")
-    lignes.append("ETAPES :")
-    for i, etape in enumerate(prompt_data["steps"], 1):
-        lignes.append(f"  {i}. {etape.replace("{nom_brut}", nom_brut)}")
-    lignes.append("")
+    lines = []
+    lines.append(f"ROLE: {prompt_data['role']}\n")
+    lines.append(f"GOAL: {prompt_data['goal']}\n")
+    lines.append("STEPS:")
+    for i, step in enumerate(prompt_data["steps"], 1):
+        lines.append(f"  {i}. {step.replace('{nom_brut}', game_name)}")
+    lines.append("")
     if prompt_data.get("tone"):
-        lignes.append(f"TON : {prompt_data['tone']}\n")
+        lines.append(f"TONE: {prompt_data['tone']}\n")
     if prompt_data.get("language"):
-        lignes.append(f"LANGUE : {prompt_data['language']}\n")
+        lines.append(f"LANGUAGE: {prompt_data['language']}\n")
     if prompt_data.get("constraints"):
-        lignes.append("CONTRAINTES :")
+        lines.append("CONSTRAINTS:")
         for c in prompt_data["constraints"]:
-            lignes.append(f"  - {c}")
-        lignes.append("")
-    lignes.append("DONNEES D'ENTREE :")
-    lignes.append(f"  Nom du jeu : {nom_brut}")
-    lignes.append(f"  Archives magazines :\n{contexte_pdf}\n")
-    lignes.append("FORMAT DE SORTIE ATTENDU (exemple) :")
-    lignes.append(json.dumps(prompt_data["output_example"], ensure_ascii=False, indent=2))
-    return "\n".join(lignes)
+            lines.append(f"  - {c}")
+        lines.append("")
+    lines.append("INPUT DATA:")
+    lines.append(f"  Game name: {game_name}")
+    lines.append(f"  Magazine context:\n{pdf_context}\n")
+    lines.append("EXPECTED OUTPUT FORMAT (example):")
+    lines.append(json.dumps(prompt_data["output_example"], ensure_ascii=False, indent=2))
+    return "\n".join(lines)
 
 
-# ---------------------------------------------
-# Helpers
-# ---------------------------------------------
+# ─────────────────────────────────────────────
+# Text helpers
+# ─────────────────────────────────────────────
 
-def nettoyer_reponse_json(texte):
-    texte = texte.strip()
-    if texte.startswith("```json"):
-        texte = texte[7:]
-    if texte.startswith("```"):
-        texte = texte[3:]
-    if texte.endswith("```"):
-        texte = texte[:-3]
-    return texte.strip()
+def clean_json_response(text):
+    """Strip markdown code fences that some LLMs add around JSON output."""
+    text = text.strip()
+    if text.startswith("```json"):
+        text = text[7:]
+    if text.startswith("```"):
+        text = text[3:]
+    if text.endswith("```"):
+        text = text[:-3]
+    return text.strip()
 
 
-def construire_pattern_recherche(nom_jeu):
+def build_search_pattern(game_name):
     """
-    Regex mot entier pour eviter les faux positifs :
-    "ico" ne matche pas "musico" ou "erico".
-    Supprime les suffixes entre parentheses/crochets : "ICO (USA)" -> "ICO"
+    Build a whole-word regex pattern for the game title.
+    - Strips parenthetical/bracket suffixes: "ICO (USA)" -> "ICO"
+    - Uses word boundaries (\b) to avoid partial matches:
+      "ICO" will not match "musico" or "erico"
     """
-    titre         = nom_jeu.split('(')[0].split('[')[0].strip()
-    titre_escaped = re.escape(titre)
-    return re.compile(r'\b' + titre_escaped + r'\b', re.IGNORECASE)
+    title         = game_name.split('(')[0].split('[')[0].strip()
+    title_escaped = re.escape(title)
+    return re.compile(r'\b' + title_escaped + r'\b', re.IGNORECASE)
 
 
-def chercher_dans_dossier_pdf(nom_jeu, dossier_magazines=DOSSIER_MAGAZINES):
-    if not os.path.exists(dossier_magazines):
-        return "Aucun dossier ./magazines/ trouve. L'IA utilisera ses propres connaissances."
+# ─────────────────────────────────────────────
+# Magazine search — PDF
+# ─────────────────────────────────────────────
 
-    pattern      = construire_pattern_recherche(nom_jeu)
-    titre_propre = nom_jeu.split('(')[0].split('[')[0].strip()
-    contexte_total = ""
+def extract_from_pdf(path, pattern, clean_title, context):
+    """
+    Scan a PDF file for pages relevant to the game being searched.
+    Only keeps pages where the title appears at least twice
+    (single mentions are likely off-topic references).
+    Returns (updated_context, limit_reached).
+    """
+    filename = os.path.basename(path)
+    try:
+        doc = fitz.open(path)
+    except Exception as e:
+        log(f"Cannot open PDF '{filename}': {e}", "warning")
+        return context, False
 
-    for fichier in os.listdir(dossier_magazines):
-        if not fichier.lower().endswith('.pdf'):
+    for page_num in range(len(doc)):
+        page      = doc.load_page(page_num)
+        page_text = page.get_text("text")
+
+        if not pattern.search(page_text):
             continue
-        chemin_pdf = os.path.join(dossier_magazines, fichier)
-        try:
-            doc = fitz.open(chemin_pdf)
-            for page_num in range(len(doc)):
-                page       = doc.load_page(page_num)
-                texte_page = page.get_text("text")
 
-                if not pattern.search(texte_page):
+        occurrences = len(pattern.findall(page_text))
+        if occurrences < 2:
+            log(f"Single mention of '{clean_title}' in '{filename}' p.{page_num+1} — skipped.")
+            continue
+
+        out(f"  -> {occurrences} match(es) in '{filename}' p.{page_num+1} — kept.")
+        log(f"PDF match: '{clean_title}' x{occurrences} in '{filename}' p.{page_num+1}")
+        context += f"\n--- Extract from '{filename}' (Page {page_num + 1}) ---\n" + page_text
+
+        if len(context) > 4000:
+            doc.close()
+            return context, True  # context size limit reached
+
+    doc.close()
+    return context, False
+
+
+# ─────────────────────────────────────────────
+# Magazine search — CBZ
+# ─────────────────────────────────────────────
+
+def extract_from_cbz(path, pattern, clean_title, context):
+    """
+    Scan a CBZ file for pages relevant to the game being searched.
+    Each image inside the ZIP archive is treated as one magazine page.
+    Text is extracted via Tesseract OCR — significantly slower than PDF.
+    OCR errors are silently logged and never shown in the terminal output.
+    Returns (updated_context, limit_reached).
+    """
+    if not CBZ_SUPPORT:
+        out("  -> CBZ support not available. Install: pip install pillow pytesseract (+ Tesseract)")
+        log("CBZ support unavailable — pillow/pytesseract not installed.", "warning")
+        return context, False
+
+    filename = os.path.basename(path)
+
+    try:
+        with zipfile.ZipFile(path, 'r') as cbz:
+            # Sort image entries to preserve reading order
+            images = sorted([
+                f for f in cbz.namelist()
+                if f.lower().endswith(('.jpg', '.jpeg', '.png', '.webp'))
+            ])
+
+            for page_num, image_name in enumerate(images):
+                try:
+                    with cbz.open(image_name) as img_file:
+                        image     = Image.open(img_file).convert("RGB")
+                        page_text = pytesseract.image_to_string(image, lang="fra+eng")
+                except Exception as e:
+                    # OCR errors are logged silently — never printed to terminal
+                    log(f"OCR error on '{filename}' p.{page_num+1} ({image_name}): {e}", "warning")
                     continue
 
-                # Filtre de pertinence : au moins 2 occurrences sur la page
-                occurrences = len(pattern.findall(texte_page))
+                if not pattern.search(page_text):
+                    continue
+
+                occurrences = len(pattern.findall(page_text))
                 if occurrences < 2:
-                    print(f"  -> Mention unique de '{titre_propre}' dans '{fichier}' "
-                          f"p.{page_num+1} -- ignoree (probablement hors-sujet).")
+                    log(f"Single mention of '{clean_title}' in '{filename}' p.{page_num+1} (CBZ) — skipped.")
                     continue
 
-                print(f"  -> {occurrences} occurrence(s) de '{titre_propre}' "
-                      f"dans '{fichier}' p.{page_num+1} -- page retenue.")
-                contexte_total += (
-                    f"\n--- Extrait du magazine '{fichier}' (Page {page_num + 1}) ---\n"
-                    + texte_page
+                out(f"  -> {occurrences} match(es) in '{filename}' p.{page_num+1} (CBZ/OCR) — kept.")
+                log(f"CBZ match: '{clean_title}' x{occurrences} in '{filename}' p.{page_num+1}")
+                context += (
+                    f"\n--- Extract from '{filename}' (Page {page_num + 1}, OCR) ---\n"
+                    + page_text
                 )
 
-                if len(contexte_total) > 4000:
-                    doc.close()
-                    return contexte_total
-            doc.close()
-        except Exception as e:
-            print(f"  -> Impossible de lire le fichier {fichier} : {e}")
+                if len(context) > 4000:
+                    return context, True
 
-    if not contexte_total:
-        return "Aucune information trouvee dans les magazines pour ce jeu."
-    return contexte_total
+    except zipfile.BadZipFile as e:
+        log(f"Cannot open CBZ '{filename}': {e}", "error")
+
+    return context, False
 
 
-def interroger_llm_pour_metadonnees(nom_brut, contexte_pdf, prompt_data):
+# ─────────────────────────────────────────────
+# Magazine search — dispatcher
+# ─────────────────────────────────────────────
+
+def search_magazines(game_name, magazines_dir=MAGAZINES_DIR):
     """
-    Reconstruit le prompt depuis les cles structurees du JSON, puis interroge Ollama.
+    Search all PDF and CBZ files in the magazines folder for content
+    relevant to the given game name.
+    Returns a text context string to be injected into the LLM prompt.
     """
-    prompt = construire_prompt_texte(prompt_data, nom_brut, contexte_pdf)
+    if not os.path.exists(magazines_dir):
+        log(f"Magazines folder not found: '{magazines_dir}'")
+        return "No magazines folder found. AI will use its own knowledge."
+
+    pattern     = build_search_pattern(game_name)
+    clean_title = game_name.split('(')[0].split('[')[0].strip()
+    context     = ""
+
+    for filename in sorted(os.listdir(magazines_dir)):
+        name_lower = filename.lower()
+        filepath   = os.path.join(magazines_dir, filename)
+
+        if name_lower.endswith('.pdf'):
+            context, limit = extract_from_pdf(filepath, pattern, clean_title, context)
+        elif name_lower.endswith('.cbz'):
+            context, limit = extract_from_cbz(filepath, pattern, clean_title, context)
+        else:
+            continue
+
+        if limit:
+            log(f"Context size limit reached while processing '{filename}'.")
+            return context
+
+    if not context:
+        log(f"No magazine content found for '{game_name}'.")
+        return "No information found in magazines for this game."
+
+    return context
+
+
+# ─────────────────────────────────────────────
+# LLM query
+# ─────────────────────────────────────────────
+
+def query_llm(game_name, pdf_context, prompt_data):
+    """
+    Build the prompt from the structured JSON and send it to Ollama.
+    Returns the parsed metadata dict, or None on failure.
+    """
+    prompt = build_prompt_text(prompt_data, game_name, pdf_context)
+    log(f"Sending prompt to Ollama for: '{game_name}'")
 
     payload = {
         "model":       MODEL_NAME,
@@ -167,210 +315,252 @@ def interroger_llm_pour_metadonnees(nom_brut, contexte_pdf, prompt_data):
         response = requests.post(OLLAMA_URL, json=payload)
         response.raise_for_status()
         data = response.json()
-        return json.loads(nettoyer_reponse_json(data["response"]))
+        result = json.loads(clean_json_response(data["response"]))
+        log(f"LLM response received for '{game_name}': is_real_game={result.get('is_real_game')}")
+        return result
     except Exception as e:
-        print(f"  -> Erreur avec Ollama : {e}")
+        out(f"  -> Ollama error: {e}", "error")
+        log(f"Ollama request failed for '{game_name}': {e}", "error")
         return None
 
 
-# ---------------------------------------------
-# Sauvegarde
-# ---------------------------------------------
+# ─────────────────────────────────────────────
+# XML save
+# ─────────────────────────────────────────────
 
-def sauvegarder(tree, fichier_sortie):
+def save_xml(tree, output_path):
+    """Write the XML tree to disk with indentation (requires Python 3.9+)."""
     if hasattr(ET, "indent"):
         ET.indent(tree, space="\t", level=0)
-    tree.write(fichier_sortie, encoding="utf-8", xml_declaration=True)
+    tree.write(output_path, encoding="utf-8", xml_declaration=True)
+    log(f"XML saved to '{output_path}'")
 
 
-# ---------------------------------------------
-# Traitement d'un jeu individuel
-# ---------------------------------------------
+# ─────────────────────────────────────────────
+# Game enrichment
+# ─────────────────────────────────────────────
 
-def enrichir_jeu(game, prompt_data, force=False):
+def enrich_game(game, prompt_data, force=False):
     """
-    Interroge le LLM et injecte les metadonnees dans l'element <game>.
-    Retourne True si des donnees ont ete modifiees.
+    Query the LLM and inject the returned metadata into a <game> XML element.
+    Skips games that already have a description unless force=True.
+    Returns True if the game was successfully updated.
     """
-    nom_element  = game.find('name')
-    desc_element = game.find('desc')
-    nom_brut     = nom_element.text if nom_element is not None else "Jeu Inconnu"
+    name_el = game.find('name')
+    desc_el = game.find('desc')
+    name    = name_el.text if name_el is not None else "Unknown Game"
 
-    if not force and desc_element is not None and desc_element.text and desc_element.text.strip():
-        print("  -> Description deja presente. Ignore (utilisez -f pour forcer).")
+    # Skip if description already exists and force mode is off
+    if not force and desc_el is not None and desc_el.text and desc_el.text.strip():
+        out("  -> Description already present. Skipped (use -f to force).")
+        log(f"Skipped '{name}': description already present.")
         return False
 
-    print("  -> Recherche dans les magazines...")
-    contexte = chercher_dans_dossier_pdf(nom_brut)
+    out("  -> Searching magazines...")
+    context = search_magazines(name)
 
-    if "Aucune information trouvee" not in contexte and "Aucun dossier" not in contexte:
-        print("  -> Article trouve ! Envoi a l'IA...")
+    if "No information found" not in context and "No magazines folder" not in context:
+        out("  -> Article found! Sending to AI...")
     else:
-        print("  -> Pas d'article. L'IA utilisera ses propres connaissances.")
+        out("  -> No article found. AI will use its own knowledge.")
 
-    metadonnees = interroger_llm_pour_metadonnees(nom_brut, contexte, prompt_data)
+    metadata = query_llm(name, context, prompt_data)
 
-    if not metadonnees or not metadonnees.get("is_real_game", False):
-        print("  -> Jeu non reconnu ou erreur LLM. Ignore.")
+    if not metadata or not metadata.get("is_real_game", False):
+        out("  -> Game not recognized or LLM error. Skipped.")
+        log(f"Skipped '{name}': not recognized or LLM error.")
         return False
 
-    if force and nom_element is not None and metadonnees.get("real_name"):
-        nom_element.text = str(metadonnees["real_name"])
+    # Update the name field if force mode is on and LLM suggests a correction
+    if force and name_el is not None and metadata.get("real_name"):
+        name_el.text = str(metadata["real_name"])
 
-    champs = ["desc", "genre", "releasedate", "developer", "publisher", "players"]
-    for champ in champs:
-        if not metadonnees.get(champ):
+    fields = ["desc", "genre", "releasedate", "developer", "publisher", "players"]
+    for field in fields:
+        if not metadata.get(field):
             continue
-        existant = game.find(champ)
-        if existant is not None:
+        existing = game.find(field)
+        if existing is not None:
             if force:
-                existant.text = str(metadonnees[champ])
+                existing.text = str(metadata[field])
         else:
-            nouveau = ET.SubElement(game, champ)
-            nouveau.text = str(metadonnees[champ])
+            new_node      = ET.SubElement(game, field)
+            new_node.text = str(metadata[field])
 
-    print("  -> Termine avec succes.")
+    out("  -> Done.")
+    log(f"Successfully enriched '{name}'.")
     return True
 
 
-# ---------------------------------------------
-# Modes principaux
-# ---------------------------------------------
+# ─────────────────────────────────────────────
+# XML loading
+# ─────────────────────────────────────────────
 
-def charger_xml(fichier):
+def load_xml(filepath):
+    """Load a gamelist XML file, or create an empty one if not found."""
     try:
-        tree = ET.parse(fichier)
+        tree = ET.parse(filepath)
         root = tree.getroot()
+        log(f"Loaded XML: '{filepath}' ({len(root.findall('game'))} games)")
     except FileNotFoundError:
-        print(f"Fichier '{fichier}' introuvable. Creation d'un nouveau gameList vide.")
+        out(f"File '{filepath}' not found. Creating empty gameList.")
+        log(f"XML not found, created empty gameList: '{filepath}'", "warning")
         root = ET.Element("gameList")
         tree = ET.ElementTree(root)
     return tree, root
 
 
-def mode_tout_traiter(prompt_data, force=False):
-    tree, root = charger_xml(FICHIER_SOURCE)
-    jeux = root.findall('game')
+# ─────────────────────────────────────────────
+# Modes
+# ─────────────────────────────────────────────
 
-    if not jeux:
-        print("Aucun jeu trouve dans la gamelist.")
+def mode_process_all(prompt_data, force=False):
+    """
+    Default mode (no arguments): process the entire gamelist.
+    Only enriches games without a description unless force=True.
+    Source file is never modified — output goes to OUTPUT_FILE.
+    """
+    tree, root = load_xml(SOURCE_FILE)
+    games      = root.findall('game')
+
+    if not games:
+        out("No games found in the gamelist.")
         return
 
-    modifications = 0
-    for index, game in enumerate(jeux):
-        nom = game.find('name').text if game.find('name') is not None else "???"
-        print(f"\n[{index + 1}/{len(jeux)}] Traitement de : '{nom}'")
-        if enrichir_jeu(game, prompt_data, force=force):
-            modifications += 1
+    updates = 0
+    for index, game in enumerate(games):
+        name = game.find('name').text if game.find('name') is not None else "???"
+        out(f"\n[{index + 1}/{len(games)}] Processing: '{name}'")
+        if enrich_game(game, prompt_data, force=force):
+            updates += 1
 
-    if modifications > 0:
-        sauvegarder(tree, FICHIER_FINAL)
-        print(f"\nTermine ! {modifications} jeu(x) mis a jour -> '{FICHIER_FINAL}'.")
+    if updates > 0:
+        save_xml(tree, OUTPUT_FILE)
+        out(f"\nDone! {updates} game(s) updated -> '{OUTPUT_FILE}'.")
     else:
-        print("\nAucune modification apportee.")
+        out("\nNo changes made.")
 
 
-def mode_ajouter_ou_mettre_a_jour(nom_jeu, prompt_data, force=False):
-    fichier_cible = FICHIER_FINAL if os.path.exists(FICHIER_FINAL) else FICHIER_SOURCE
-    tree, root    = charger_xml(fichier_cible)
-    jeux          = root.findall('game')
+def mode_add(game_name, prompt_data, force=False):
+    """
+    -add mode: add a new game entry or update an existing one.
+    Reads OUTPUT_FILE if it exists, otherwise SOURCE_FILE.
+    Always writes to OUTPUT_FILE.
+    """
+    target = OUTPUT_FILE if os.path.exists(OUTPUT_FILE) else SOURCE_FILE
+    tree, root = load_xml(target)
+    games      = root.findall('game')
 
-    jeu_cible = None
-    for g in jeux:
-        nom_elem = g.find('name')
-        if nom_elem is not None and nom_jeu.lower() == nom_elem.text.lower():
-            jeu_cible = g
+    # Search for an existing entry (case-insensitive)
+    match = None
+    for g in games:
+        name_el = g.find('name')
+        if name_el is not None and game_name.lower() == name_el.text.lower():
+            match = g
             break
 
-    if jeu_cible is not None:
-        print(f"Le jeu '{nom_jeu}' existe deja dans '{fichier_cible}'.")
+    if match is not None:
+        out(f"Game '{game_name}' already exists in '{target}'.")
+        log(f"Add mode: '{game_name}' already exists in '{target}'.")
         if not force:
-            print("Utilisez -f pour forcer la mise a jour.")
+            out("Use -f to force update.")
             return
-        print("Mode force active : mise a jour en cours...")
+        out("Force mode active: updating...")
     else:
-        print(f"Jeu '{nom_jeu}' non trouve. Creation d'une nouvelle entree...")
-        jeu_cible = ET.SubElement(root, 'game')
-        ET.SubElement(jeu_cible, 'path').text = f"./{nom_jeu}.iso"
-        ET.SubElement(jeu_cible, 'name').text = nom_jeu
-        force = True  # nouveau jeu => toujours enrichir
+        out(f"Game '{game_name}' not found. Creating new entry...")
+        log(f"Add mode: creating new entry for '{game_name}'.")
+        match = ET.SubElement(root, 'game')
+        ET.SubElement(match, 'path').text = f"./{game_name}.iso"
+        ET.SubElement(match, 'name').text = game_name
+        force = True  # new entry is always enriched
 
-    print(f"\n[1/1] Traitement de : '{nom_jeu}'")
-    if enrichir_jeu(jeu_cible, prompt_data, force=force):
-        sauvegarder(tree, FICHIER_FINAL)
-        print(f"\nFichier '{FICHIER_FINAL}' mis a jour.")
+    out(f"\n[1/1] Processing: '{game_name}'")
+    if enrich_game(match, prompt_data, force=force):
+        save_xml(tree, OUTPUT_FILE)
+        out(f"\nFile '{OUTPUT_FILE}' updated.")
     else:
-        print("\nAucune modification apportee.")
+        out("\nNo changes made.")
 
 
-def mode_rechercher(recherche, prompt_data, force=False):
-    fichier_cible = FICHIER_FINAL if os.path.exists(FICHIER_FINAL) else FICHIER_SOURCE
-    tree, root    = charger_xml(fichier_cible)
-    jeux          = root.findall('game')
+def mode_search(search_term, prompt_data, force=False):
+    """
+    -rom mode: filter games by name and enrich matching entries.
+    Reads OUTPUT_FILE if it exists, otherwise SOURCE_FILE.
+    Always writes to OUTPUT_FILE.
+    """
+    target = OUTPUT_FILE if os.path.exists(OUTPUT_FILE) else SOURCE_FILE
+    tree, root = load_xml(target)
+    games      = root.findall('game')
 
-    correspondances = [
-        g for g in jeux
+    matches = [
+        g for g in games
         if g.find('name') is not None
-        and recherche.lower() in g.find('name').text.lower()
+        and search_term.lower() in g.find('name').text.lower()
     ]
 
-    if not correspondances:
-        print(f"Aucun jeu trouve pour '{recherche}'. Utilisez -add pour le creer.")
+    if not matches:
+        out(f"No game found matching '{search_term}'. Use -add to create it.")
+        log(f"Search mode: no match for '{search_term}'.", "warning")
         return
 
-    modifications = 0
-    for index, game in enumerate(correspondances):
-        nom = game.find('name').text
-        print(f"\n[{index + 1}/{len(correspondances)}] Traitement de : '{nom}'")
-        if enrichir_jeu(game, prompt_data, force=force):
-            modifications += 1
+    updates = 0
+    for index, game in enumerate(matches):
+        name = game.find('name').text
+        out(f"\n[{index + 1}/{len(matches)}] Processing: '{name}'")
+        if enrich_game(game, prompt_data, force=force):
+            updates += 1
 
-    if modifications > 0:
-        sauvegarder(tree, FICHIER_FINAL)
-        print(f"\n{modifications} jeu(x) mis a jour -> '{FICHIER_FINAL}'.")
+    if updates > 0:
+        save_xml(tree, OUTPUT_FILE)
+        out(f"\n{updates} game(s) updated -> '{OUTPUT_FILE}'.")
     else:
-        print("\nAucune modification apportee.")
+        out("\nNo changes made.")
 
 
-# ---------------------------------------------
-# Point d'entree
-# ---------------------------------------------
+# ─────────────────────────────────────────────
+# Entry point
+# ─────────────────────────────────────────────
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Complete les metadonnees d'un gamelist.xml via une IA locale (Ollama).",
+        description="Enrich a gamelist.xml with AI-generated metadata via a local Ollama instance.",
         formatter_class=argparse.RawTextHelpFormatter,
-        epilog=f"""
-Exemples d'utilisation :
-  python gamelist_updater.py                                   Traite toute la gamelist (jeux sans description)
-  python gamelist_updater.py -f                                Traite toute la gamelist et ecrase les donnees existantes
-  python gamelist_updater.py -rom "God of War"                 Cherche et enrichit le(s) jeu(x) correspondant(s)
-  python gamelist_updater.py -add "Ico"                        Ajoute 'Ico' s'il n'existe pas, sinon signale l'existence
-  python gamelist_updater.py -add "Ico" -f                     Ajoute ou met a jour 'Ico' en forcant l'ecrasement
-  python gamelist_updater.py -prompt ./prompts/prompt_en.json  Utilise un prompt personnalise
-  python gamelist_updater.py -prompt ./prompts/prompt_en.json -add "Ico"  Combine prompt custom + ajout
+        epilog="""
+Examples:
+  python gamelist_updater.py                                   Process all games (missing descriptions only)
+  python gamelist_updater.py -f                                Process all games and overwrite existing data
+  python gamelist_updater.py -rom "God of War"                 Find and enrich matching game(s)
+  python gamelist_updater.py -add "ICO"                        Add 'ICO' if not found, or warn if it exists
+  python gamelist_updater.py -add "ICO" -f                     Add or force-update 'ICO'
+  python gamelist_updater.py -prompt ./prompts/prompt_en.json  Use a custom prompt file
+  python gamelist_updater.py -prompt ./prompts/prompt_en.json -add "ICO"
 """
     )
     parser.add_argument("-rom",    type=str, default=None,
-                        help="Recherche et enrichit les jeux dont le nom contient ce terme.")
+                        help="Find and enrich games whose name contains this term.")
     parser.add_argument("-add",    type=str, default=None,
-                        help="Ajoute un jeu ou le met a jour (requiert -f pour ecraser).")
+                        help="Add a game or update an existing one (requires -f to overwrite).")
     parser.add_argument("-f", "--force", action="store_true",
-                        help="Force l'ecrasement des donnees existantes.")
-    parser.add_argument("-prompt", type=str, default=PROMPT_DEFAUT,
-                        help=f"Chemin vers le fichier prompt .json (defaut : {PROMPT_DEFAUT}).")
+                        help="Force overwrite of existing metadata.")
+    parser.add_argument("-prompt", type=str, default=DEFAULT_PROMPT,
+                        help=f"Path to the prompt JSON file (default: {DEFAULT_PROMPT}).")
     args = parser.parse_args()
 
-    # Chargement du prompt — echec rapide si fichier absent ou invalide
+    log("=" * 60)
+    log(f"Session started — args: {vars(args)}")
+
+    # Load prompt — fail fast if file is missing or malformed
     try:
-        prompt_data = charger_prompt(args.prompt)
+        prompt_data = load_prompt(args.prompt)
     except (FileNotFoundError, ValueError) as e:
-        print(f"\nERREUR : {e}")
+        out(f"\nERROR: {e}", "error")
         exit(1)
 
     if args.add:
-        mode_ajouter_ou_mettre_a_jour(args.add, prompt_data, force=args.force)
+        mode_add(args.add, prompt_data, force=args.force)
     elif args.rom:
-        mode_rechercher(args.rom, prompt_data, force=args.force)
+        mode_search(args.rom, prompt_data, force=args.force)
     else:
-        mode_tout_traiter(prompt_data, force=args.force)
+        mode_process_all(prompt_data, force=args.force)
+
+    log("Session ended.")
